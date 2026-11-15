@@ -1,0 +1,183 @@
+@import "tailwindcss";
+
+/* 字体自托管（@fontsource）：对齐 Tick 的 Inter + JetBrains Mono。
+   不走 CDN——桌面版必须离线可用，而且外链会阻塞首屏渲染。 */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "@fontsource/jetbrains-mono/600.css";
+
+@theme {
+  --color-bg: #08090c;
+  --color-bg2: #0d0f14;
+  --color-side: #0a0c10;
+  --color-card: #11141a;
+  --color-card2: #161a22;
+  --color-line: #1c212b;
+  --color-line2: #262d3a;
+  --color-fg: #e9eef7;
+  --color-fg2: #94a3b8;
+  --color-fg3: #7b8aa0;
+  /* 红涨绿跌（A 股惯例）：up = 红，down = 绿 */
+  --color-up: #f6465d;
+  --color-down: #0ecb81;
+  --color-brand: #7c5cff;
+  --color-cyan: #22d3ee;
+  --color-gold: #f0b90b;
+
+  /* 正文：Inter 管拉丁字母，中文回退到鸿蒙/苹方（Tick 同款回退链） */
+  --font-sans: "Inter", "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  /* 数字：JetBrains Mono，等宽 + tabular-nums，价格跳动不抖 */
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+
+  /* 字号体系：对齐 Tick 的六档（8/9/10/11/12/14），
+     不再用 9.5 / 10.5 / 11.5 / 12.5 这种半像素值——层次是靠跳跃，不是靠 0.5px。 */
+  --text-2xs: 8px;
+  --text-2xs--line-height: 1.25;
+  --text-3xs: 10px;   /* 小字下限：和首页 meta 一致，不再出现 9px */
+  --text-3xs--line-height: 1.3;
+  --text-xs2: 11px;   /* 标签/表头：对齐首页 hint 档 */
+  --text-xs2--line-height: 1.3;
+  --text-sm2: 11px;
+  --text-sm2--line-height: 1.35;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font: 13px/1.5 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+/* 数字统一等宽 + 表格数字对齐 */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+ * Tick Stock Panel 的设计 token 兼容层
+ *
+ * 搬过来的看板组件用的是 TSP 的变量名（--base/--surface/--border/
+ * --bull/--bear/--accent…）。这里按 TSP 暗色主题的 HSL 值补上，
+ * 用 @theme inline 映射成 Tailwind 类名（bg-surface / text-bull …），
+ * 这样 TSP 组件能原样渲染，我们原有的 bg-card / text-fg 也不受影响。
+ * ============================================================ */
+:root {
+  --base: 240 5% 5%;
+  --surface: 240 7% 10%;
+  --elevated: 240 9% 14%;
+  --border: 240 5% 22%;
+  --fg-primary: 0 0% 98%;
+  --fg-secondary: 240 5% 78%;
+  --fg-muted: 240 5% 58%;
+  --accent: 217 91% 60%;
+  --bull: 4 87% 60%;
+  --bear: 152 67% 45%;
+  --warning: 32 95% 50%;
+  --danger: 4 87% 60%;
+}
+
+@theme inline {
+  --color-base: hsl(var(--base));
+  --color-surface: hsl(var(--surface));
+  --color-elevated: hsl(var(--elevated));
+  --color-border: hsl(var(--border));
+  --color-foreground: hsl(var(--fg-primary));
+  --color-secondary: hsl(var(--fg-secondary));
+  --color-muted: hsl(var(--fg-muted));
+  --color-accent: hsl(var(--accent));
+  --color-bull: hsl(var(--bull));
+  --color-bear: hsl(var(--bear));
+  --color-warning: hsl(var(--warning));
+  --color-danger: hsl(var(--danger));
+  --radius-card: 8px;
+}
+
+/* TSP 组件假设全局 border-color 是它的 --border；限定在 .tick-scope 内避免影响我们的页面 */
+.tick-scope * {
+  border-color: hsl(var(--border));
+}
+.tick-scope {
+  background: hsl(var(--base));
+  color: hsl(var(--fg-primary));
+  -webkit-font-smoothing: subpixel-antialiased;
+}
+
+/* ============================================================
+ * 除交易首页外的页面：文字架构对齐「市场看板」
+ *
+ * 首页（Tick 版看板）的档位是：
+ *   页面标题 16/24 600 · 区块标题 12 600（带 accent 竖条）
+ *   正文 11 · 标签/说明 10 · 极次要 9 · 数值 等宽 + tabular-nums
+ * 旧页面还是 Tailwind 默认档（12/14/18），同一个应用里两套尺度。
+ *
+ * 这里只收敛非首页出口（AppShell 给 <main> 加的 .app-page），首页
+ * 的 .tick-scope 完全不受影响；以后调尺度只改这一处。
+ * ============================================================ */
+.app-page {
+  font: 11px/1.45 var(--font-sans);
+}
+/* 旧页面的 text-xs 多做正文，对齐首页的正文 11px */
+.app-page .text-xs {
+  font-size: 11px;
+  line-height: 1.45;
+}
+/* text-sm 是"强调/数值"档，对应首页的 12px */
+.app-page .text-sm {
+  font-size: 12px;
+  line-height: 1.45;
+}
+.app-page .text-base {
+  font-size: 12px;
+}
+/* text-lg 只用在指标大数上，对齐首页 KPI 的 15px */
+.app-page .text-lg {
+  font-size: 15px;
+}
+/* 页面标题：对齐 Tick 的 PageHeader 字号（text-xl 20px），颜色取纯白，不用渐变 */
+.app-page .page-title {
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--color-fg);
+}
+/* 区块标题：与首页 SectionTitle 同档（12px / 600） */
+.app-page .card-title {
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+/* 正文、表格里的数字一律等宽 + 等宽数字，和首页一致 */
+.app-page .num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #232a36;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2f3846;
+}

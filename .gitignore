@@ -1,0 +1,36 @@
+# 数据（体积大，可重建）
+backend/data/
+bundled/
+data/
+
+# 构建产物
+dist/
+build/
+*.spec.bak
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# 前端
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.vite/
+
+# 运行时
+logs/
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+# 备份
+*-backup-*/
+*.zip
+
+# 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

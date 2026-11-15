@@ -1,0 +1,20 @@
+services:
+  facet:
+    build: .
+    image: facet:local
+    container_name: facet
+    # 宿主 3030 → 容器 3018。不要用 3021：那是桌面版 exe 占用的端口
+    ports:
+      - "3030:3018"
+    environment:
+      - DATA_DIR=/app/data
+      - STATIC_DIR=/app/web
+      - TZ=Asia/Shanghai
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
+    volumes:
+      # 数据一定要挂出来：容器重建后 gens/ 和 daily/ 都在这里
+      # 想用桌面版的数据（含 5,215 只、650 万行）就挂这个：
+      #   - ${LOCALAPPDATA}/Facet/data:/app/data
+      - ./backend/data:/app/data
+    restart: unless-stopped
