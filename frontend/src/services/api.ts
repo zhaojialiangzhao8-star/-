@@ -187,9 +187,31 @@ export interface RunMeta {
   kind: string
   title: string
   created_at: string
+  strategy?: string
+  start_date?: string
+  end_date?: string
+  generation?: string
   params: Record<string, unknown>
   metrics: Partial<BacktestMetrics>
-  trade_count: number
+  /** 大盘状态摘要：dominant / dist / index_return / by_state */
+  regime?: {
+    dominant?: string
+    dist?: Record<string, number>
+    index_return?: number | null
+    index_from?: string
+    index_to?: string
+    by_state?: Record<string, { trades: number; win_rate: number | null; pnl: number }>
+  }
+  /** 附加统计：平均持仓天数、成本参数 */
+  extras?: {
+    avg_hold_days?: number | null
+    max_hold_days?: number | null
+    closed_trades?: number
+    commission_rate?: number
+    stamp_tax_rate?: number
+    slippage_bps?: number
+  }
+  trade_count?: number
 }
 
 export interface RunDetail extends RunMeta {
@@ -471,9 +493,15 @@ export const api = {
     req<BacktestResult>('/bt/run', { method: 'POST', body: JSON.stringify(body) }),
 
   /* 回测历史（后端落盘 data/runs/*.json） */
-  runs: (limit = 30) => req<{ items: RunMeta[]; count: number }>(`/runs?limit=${limit}`),
+  runs: (limit = 100, strategy = '') =>
+    req<{ items: RunMeta[]; count: number }>(
+      `/runs?limit=${limit}${strategy ? `&strategy=${encodeURIComponent(strategy)}` : ''}`,
+    ),
   runDetail: (id: string) => req<RunDetail>(`/runs/${encodeURIComponent(id)}`),
   deleteRun: (id: string) => req<{ deleted: string }>(`/runs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** Excel 导出地址（浏览器直接下载，不走 fetch） */
+  runsExportUrl: (ids?: string[]) =>
+    `${BASE}/runs/export.xlsx${ids && ids.length ? `?ids=${encodeURIComponent(ids.join(','))}` : ''}`,
 
   /* 策略库 —— 开关直接改 strategies/enabled.json 并重载引擎 */
   strategyLib: () => req<StrategyLibResp>('/strategy-lib'),

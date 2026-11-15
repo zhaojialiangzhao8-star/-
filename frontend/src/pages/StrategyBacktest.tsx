@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { History, ListChecks, Play, RotateCcw, Trash2 } from 'lucide-react'
+import { Download, History, ListChecks, Play, RotateCcw, Trash2 } from 'lucide-react'
 import { api, type BacktestResult, type BtParams, type Trade } from '../services/api'
 import { Card, DataTable, Metric, Modal, Tag } from '../components/ui'
 import EquityChart from '../components/EquityChart'
@@ -49,6 +49,11 @@ export default function StrategyBacktest() {
 
   const strategies = useQuery({ queryKey: ['strategies'], queryFn: api.strategies, staleTime: 300_000 })
 
+  /** 当前选中策略的完整信息（描述 / 标签），用于选择器下面的说明行 */
+  const selectedStrategy = (strategies.data?.items ?? []).find(
+    (s) => (s as { id: string }).id === form.strategy,
+  ) as { id: string; name?: string; description?: string; tags?: string[] } | undefined
+
   // 策略列表加载后，如果当前选中的策略不在列表里（首次进入是空串，
   // 或之前选的策略已被删除），自动落到第一个可用策略。
   // 不写死默认策略的原因：策略库会变，写死就会像 classic_reversal 那样报「策略不存在」。
@@ -68,7 +73,12 @@ export default function StrategyBacktest() {
   const nameOf = (sym: string): string => names.data?.items?.[sym] ?? ''
 
   const [sp, setSearchParams] = useSearchParams()
-  const runs = useQuery({ queryKey: ['runs'], queryFn: () => api.runs(30), staleTime: 10_000 })
+  const [runFilter, setRunFilter] = useState<string>('')
+  const runs = useQuery({
+    queryKey: ['runs', runFilter],
+    queryFn: () => api.runs(100, runFilter),
+    staleTime: 10_000,
+  })
 
   /** 打开一条历史：把参数还原到表单，结果直接铺到结果区 */
   const openRun = async (id: string) => {
@@ -503,6 +513,28 @@ export default function StrategyBacktest() {
                 </>
               )}
 
+              {mode === 'strategy' && (
+                <div className="col-span-2 -mt-0.5">
+                  {selectedStrategy?.description ? (
+                    <div
+                      className="rounded border border-bull/25 bg-bull/[0.07] px-2 py-1.5 text-[11px] leading-relaxed text-bull/90"
+                      title={selectedStrategy.description}
+                    >
+                      {selectedStrategy.description}
+                      {selectedStrategy.tags && selectedStrategy.tags.length > 0 && (
+                        <span className="ml-1.5 text-[10px] text-bull/60">
+                          [{selectedStrategy.tags.join(' · ')}]
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="rounded border border-dashed border-line px-2 py-1.5 text-[11px] text-fg3">
+                      这个策略没写描述（策略文件里的 META.description）
+                    </div>
+                  )}
+                </div>
+              )}
+
               <Field label="初始资金（元）">
                 <Num value={form.init_cash} onChange={(v) => set('init_cash', v)} />
               </Field>
@@ -548,9 +580,33 @@ export default function StrategyBacktest() {
                 <History size={12} className="text-fg3" />
                 <span className="text-sm2 font-medium text-fg2">回测历史</span>
                 <span className="font-mono text-xs2 text-fg3">{runs.data?.count ?? 0} 条</span>
+                <select
+                  value={runFilter}
+                  onChange={(e) => setRunFilter(e.target.value)}
+                  className="ml-1 rounded border border-line2 bg-card2 px-1 py-0.5 text-[10px] text-fg2 outline-none focus:border-brand"
+                  title="按策略筛选历史"
+                >
+                  <option value="">全部策略</option>
+                  {[...new Set((runs.data?.items ?? []).map((r) => r.strategy || r.title))].filter(Boolean).map((sid) => (
+                    <option key={sid} value={sid}>
+                      {sid}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => {
+                    if (!runs.data?.count) return
+                    window.open(api.runsExportUrl(), '_blank')
+                  }}
+                  disabled={!runs.data?.count}
+                  className="ml-auto flex items-center gap-0.5 text-xs2 text-fg3 hover:text-accent disabled:opacity-40"
+                  title="把全部回测记录导出成 Excel（汇总 / 分状态 / 逐笔）"
+                >
+                  <Download size={11} /> 导出
+                </button>
                 <button
                   onClick={() => runs.refetch()}
-                  className="ml-auto text-xs2 text-fg3 hover:text-fg2"
+                  className="text-xs2 text-fg3 hover:text-fg2"
                   title="刷新历史列表"
                 >
                   刷新
@@ -578,6 +634,39 @@ export default function StrategyBacktest() {
                       <span className="min-w-0 flex-1 truncate text-xs2 text-fg2">
                         {it.title || it.kind}
                       </span>
+                      {(() => {
+                        // 徽章只放一个字：强 / 横 / 弱；全称和占比放 tooltip
+                        const d = it.regime?.dominant
+                        const short = d === '强市' ? '强' : d === '弱市' ? '弱' : d === '震荡' ? '横' : '—'
+                        const cls =
+                          d === '强市'
+                            ? 'bg-bull/15 text-bull'
+                            : d === '弱市'
+                              ? 'bg-bear/15 text-bear'
+                              : d === '震荡'
+                                ? 'bg-card2 text-fg2'
+                                : 'bg-card2 text-fg3'
+                        const tip = d
+                          ? `区间大盘状态：${d}（${Object.entries(it.regime?.dist || {})
+                              .map(([k, v]) => `${k} ${v}%`)
+                              .join(' / ')}）${
+                              it.regime?.index_return != null ? ` · 指数 ${it.regime.index_return}%` : ''
+                            }`
+                          : '这条老记录没有起止日期，算不了区间大盘状态'
+                        return (
+                          <span
+                            className={`shrink-0 rounded px-1.5 text-center font-mono text-[10px] leading-[16px] ${cls}`}
+                            title={tip}
+                          >
+                            {short}
+                          </span>
+                        )
+                      })()}
+                      {it.extras?.avg_hold_days != null && (
+                        <span className="shrink-0 font-mono text-[10px] text-fg3" title="平均持仓天数（自然日）">
+                          {it.extras.avg_hold_days}天
+                        </span>
+                      )}
                       <span
                         className={`w-[54px] shrink-0 text-right font-mono text-xs2 ${pctClass(
                           (it.metrics?.total_return ?? 0) as number,
@@ -585,6 +674,13 @@ export default function StrategyBacktest() {
                       >
                         {fmtPct((it.metrics?.total_return ?? 0) as number)}
                       </span>
+                    </button>
+                    <button
+                      onClick={() => window.open(api.runsExportUrl([it.id]), '_blank')}
+                      className="shrink-0 rounded p-0.5 text-fg3 opacity-0 hover:text-accent group-hover:opacity-100"
+                      title="导出这条记录（含逐笔成交）"
+                    >
+                      <Download size={11} />
                     </button>
                     <button
                       onClick={() => delRun(it.id)}

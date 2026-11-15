@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from . import config, indicators
@@ -795,82 +795,289 @@ def kline_trend(symbol: str, days: int = Query(1, ge=1, le=5)) -> dict:
     }
 
 
-# ---------------------------------------------------------------- 回测历史（落盘）
+# ---------------------------------------------------------------- 回测历史（SQLite + Excel 导出）
 RUNS_DIR = Path(config.DATA_DIR) / "runs"
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
+RUNS_DB = Path(config.DATA_DIR) / "facet.db"
+_MIGRATED = False
+
+
+def _runs_db_path() -> Path:
+    global _MIGRATED
+    if not _MIGRATED:
+        try:
+            from .runs_db import migrate_json_dir
+
+            migrate_json_dir(RUNS_DB, RUNS_DIR)
+        except Exception:  # noqa: BLE001
+            pass
+        _MIGRATED = True
+    return RUNS_DB
+
+
+def _hold_days(trades: list[dict]) -> dict:
+    """按 symbol 配对买/卖，算持仓天数（自然日）。"""
+    from datetime import date as _d
+
+    open_pos: dict[str, list[str]] = {}
+    holds: list[int] = []
+    for t in trades:
+        sym = t.get("symbol")
+        dt = str(t.get("dt") or "")[:10]
+        if not sym or not dt:
+            continue
+        if t.get("side") == "buy":
+            open_pos.setdefault(sym, []).append(dt)
+        elif t.get("side") == "sell" and open_pos.get(sym):
+            buy_dt = open_pos[sym].pop(0)
+            try:
+                holds.append(((_d.fromisoformat(dt) - _d.fromisoformat(buy_dt)).days))
+            except ValueError:
+                pass
+    if not holds:
+        return {"avg_hold_days": None, "max_hold_days": None, "closed_trades": 0}
+    return {
+        "avg_hold_days": round(sum(holds) / len(holds), 1),
+        "max_hold_days": max(holds),
+        "closed_trades": len(holds),
+    }
+
+
+def _regime_stats(result: dict, start: str | None, end: str | None) -> dict:
+    """区间大盘状态 + 分状态胜率（用买入日的状态给这笔交易归类）。"""
+    try:
+        from . import market_regime as mr
+        from .runtime import STORE
+
+        mr.build(STORE)
+        summary = mr.summarize(start, end)
+        day_labels = mr.by_date(start, end)
+    except Exception:  # noqa: BLE001
+        return {}
+
+    trades = result.get("trades") or []
+    buckets: dict[str, dict] = {}
+    open_pos: dict[str, str] = {}
+    for t in trades:
+        dt = str(t.get("dt") or "")[:10]
+        sym = t.get("symbol")
+        if t.get("side") == "buy":
+            open_pos[sym] = dt
+        elif t.get("side") == "sell" and sym in open_pos:
+            buy_dt = open_pos.pop(sym)
+            from datetime import date as _d
+
+            lb = day_labels.get(_d.fromisoformat(buy_dt)) if buy_dt else None
+            if not lb:
+                continue
+            b = buckets.setdefault(lb, {"n": 0, "win": 0, "pnl": 0.0})
+            b["n"] += 1
+            pnl = float(t.get("pnl") or 0)
+            b["pnl"] += pnl
+            if pnl > 0:
+                b["win"] += 1
+    by_state = {
+        k: {
+            "trades": v["n"],
+            "win_rate": round(v["win"] / v["n"] * 100, 1) if v["n"] else None,
+            "pnl": round(v["pnl"], 2),
+        }
+        for k, v in buckets.items()
+    }
+    if summary:
+        summary["by_state"] = by_state
+    return summary
 
 
 def _save_run(kind: str, params: dict, result: dict, title: str = "") -> str:
-    """把一次回测的参数 + 结果写进 data/runs/<id>.json，重启后还能翻出来。"""
-    import json as _json
-    import time as _time
-    import uuid as _uuid
+    """写一条回测记录到 SQLite（参数 / 指标 / 大盘状态 / 持仓天数 / 完整结果）。"""
+    from . import runs_db
 
-    run_id = f"{_time.strftime('%Y%m%d-%H%M%S')}-{_uuid.uuid4().hex[:6]}"
-    payload = {
-        "id": run_id,
-        "kind": kind,
-        "title": title,
-        "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
-        "params": params,
-        "metrics": result.get("metrics") or {},
-        "result": result,
-    }
+    start = params.get("start") or ""
+    end = params.get("end") or ""
+    extras = _hold_days(result.get("trades") or [])
+    # 成本参数随记录带走（现在只在请求里，记录里看不到）
+    for k in ("commission_rate", "stamp_tax_rate", "slippage_bps"):
+        if k in params:
+            extras[k] = params[k]
+    gen = ""
     try:
-        (RUNS_DIR / f"{run_id}.json").write_text(
-            _json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8"
+        from .runtime import STORE as _S
+
+        gen = _S.require().generation
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return runs_db.save(
+            _runs_db_path(),
+            {
+                "kind": kind,
+                "strategy": params.get("strategy") or "",
+                "title": title or params.get("strategy") or "",
+                "start_date": start,
+                "end_date": end,
+                "generation": gen,
+                "params": params,
+                "metrics": result.get("metrics") or {},
+                "regime": _regime_stats(result, start or None, end or None),
+                "extras": extras,
+                "result": result,
+            },
         )
-    except OSError:
+    except Exception:  # noqa: BLE001
         return ""
-    return run_id
+
+
+def _backfill_regimes(limit: int = 20) -> None:
+    """老记录（从 JSON 迁移进来的）没有大盘状态，补算一次并存回。
+
+    没有起止日期的记录算不了区间状态（早期 simple 回测没存日期），跳过即可。
+    """
+    from . import runs_db
+
+    db = _runs_db_path()
+    for row in runs_db.missing_regime(db, limit=limit):
+        params = row.get("params") or {}
+        start = row.get("start_date") or params.get("start") or ""
+        end = row.get("end_date") or params.get("end") or ""
+        if not start and not end:
+            continue
+        try:
+            regime = _regime_stats(row.get("result") or {}, start or None, end or None)
+        except Exception:  # noqa: BLE001
+            continue
+        if regime:
+            runs_db.update_regime(db, row["id"], regime)
+    # 顺手补持仓天数（老记录迁移时没算）
+    for row in runs_db.list_runs(db, limit=50):
+        ex = row.get("extras") or {}
+        if ex.get("avg_hold_days") is not None:
+            continue
+        full = runs_db.get(db, row["id"]) or {}
+        trades = (full.get("result") or {}).get("trades") or []
+        if not trades:
+            continue
+        try:
+            runs_db.update_extras(db, row["id"], {**ex, **_hold_days(trades)})
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @router.get("/runs")
-def list_runs(limit: int = Query(30, ge=1, le=200)) -> dict:
-    """回测历史列表（只回元信息，不带 trades）。"""
-    import json as _json
+def list_runs(
+    limit: int = Query(100, ge=1, le=500),
+    strategy: str = Query(""),
+) -> dict:
+    """回测历史列表（元信息；不含 trades/nav）。"""
+    from . import runs_db
 
-    items = []
-    for f in sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
-        try:
-            d = _json.loads(f.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            continue
-        m = d.get("metrics") or {}
-        items.append(
-            {
-                "id": d.get("id"),
-                "kind": d.get("kind"),
-                "title": d.get("title") or "",
-                "created_at": d.get("created_at"),
-                "params": d.get("params") or {},
-                "metrics": {
-                    k: m.get(k)
-                    for k in ("total_return", "annual_return", "max_drawdown", "sharpe", "win_rate", "trades")
-                    if k in m
-                },
-                "trade_count": len((d.get("result") or {}).get("trades") or []),
-            }
-        )
+    try:
+        _backfill_regimes()
+    except Exception:  # noqa: BLE001
+        pass
+    items = runs_db.list_runs(_runs_db_path(), limit=limit, strategy=strategy)
     return {"items": items, "count": len(items)}
+
+
+@router.get("/runs/export.xlsx")
+def export_runs(ids: str = Query("", description="逗号分隔；空=全部")) -> Response:
+    """导出 Excel：汇总 / 分状态统计 / 逐笔成交（仅单选时）。"""
+    from urllib.parse import quote
+
+    from . import runs_db
+    from .xlsx_min import write_xlsx
+
+    db = _runs_db_path()
+    if ids:
+        picked = [runs_db.get(db, i) for i in ids.split(",") if i.strip()]
+        rows = [r for r in picked if r]
+    else:
+        rows = [runs_db.get(db, r["id"]) for r in runs_db.list_runs(db, limit=500)]
+        rows = [r for r in rows if r]
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="没有可导出的回测记录")
+
+    header = [
+        "回测时间", "策略", "区间起", "区间止", "初始资金", "单笔止损额", "最大持仓",
+        "单票上限%", "止损%", "止盈%", "最大持有天数", "总收益", "收益率%", "年化%",
+        "最大回撤%", "夏普", "卡玛", "胜率%", "盈亏比", "交易笔数", "平均持仓天数",
+        "最大持仓天数", "大盘状态", "强市占比%", "震荡占比%", "弱市占比%",
+        "同期指数%", "数据代际", "佣金", "印花税", "滑点bps",
+    ]
+    body = []
+    state_rows = []
+    for r in rows:
+        m = r.get("metrics") or {}
+        p = r.get("params") or {}
+        g = r.get("regime") or {}
+        ex = r.get("extras") or {}
+        dist = g.get("dist") or {}
+        body.append([
+            r.get("created_at"), r.get("strategy"), g.get("index_from") or p.get("start"),
+            g.get("index_to") or p.get("end"), p.get("init_cash"), p.get("risk_amount"),
+            p.get("max_positions"), p.get("max_position_pct"), p.get("stop_loss_pct"),
+            p.get("take_profit_pct"), p.get("max_hold_days"),
+            m.get("total_pnl"), round(float(m.get("total_return") or 0) * 100, 2),
+            round(float(m.get("annual_return") or 0) * 100, 2),
+            round(float(m.get("max_drawdown") or 0) * 100, 2),
+            m.get("sharpe"), m.get("calmar"), round(float(m.get("win_rate") or 0) * 100, 2),
+            m.get("profit_factor"), m.get("trades"), ex.get("avg_hold_days"),
+            ex.get("max_hold_days"), g.get("dominant"), dist.get("强市"), dist.get("震荡"),
+            dist.get("弱市"), g.get("index_return"), r.get("generation", "")[:8],
+            p.get("commission_rate"), p.get("stamp_tax_rate"), p.get("slippage_bps"),
+        ])
+        for state, v in (g.get("by_state") or {}).items():
+            state_rows.append([
+                r.get("created_at"), r.get("strategy"), state, v.get("trades"),
+                v.get("win_rate"), v.get("pnl"),
+            ])
+
+    sheets = [
+        ("汇总", header, body),
+        ("分状态统计", ["回测时间", "策略", "大盘状态", "交易笔数", "胜率%", "盈亏"], state_rows),
+    ]
+
+    if len(rows) == 1:
+        trades = (rows[0].get("result") or {}).get("trades") or []
+        t_header = ["日期", "代码", "方向", "数量", "价格", "金额", "盈亏", "原因"]
+        t_body = [
+            [
+                str(t.get("dt") or "")[:10], t.get("symbol"), "买入" if t.get("side") == "buy" else "卖出",
+                t.get("qty"), t.get("price"), t.get("amount"), t.get("pnl"), t.get("reason"),
+            ]
+            for t in trades
+        ]
+        sheets.append(("逐笔成交", t_header, t_body))
+
+    tmp = Path(config.DATA_DIR) / f"export_{int(__import__('time').time())}.xlsx"
+    write_xlsx(tmp, sheets)
+    data = tmp.read_bytes()
+    tmp.unlink(missing_ok=True)
+    name = f"回测记录_{__import__('time').strftime('%Y%m%d_%H%M')}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"},
+    )
 
 
 @router.get("/runs/{run_id}")
 def get_run(run_id: str) -> dict:
-    import json as _json
+    from . import runs_db
 
-    f = RUNS_DIR / f"{run_id}.json"
-    if not f.exists():
+    row = runs_db.get(_runs_db_path(), run_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="回测记录不存在")
-    return _json.loads(f.read_text(encoding="utf-8"))
+    return row
 
 
 @router.delete("/runs/{run_id}")
 def delete_run(run_id: str) -> dict:
-    f = RUNS_DIR / f"{run_id}.json"
-    if not f.exists():
+    from . import runs_db
+
+    if not runs_db.delete(_runs_db_path(), run_id):
         raise HTTPException(status_code=404, detail="回测记录不存在")
-    f.unlink()
     return {"deleted": run_id}
 
 
